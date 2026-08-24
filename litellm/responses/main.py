@@ -1,6 +1,7 @@
 import asyncio
 import contextvars
-from collections.abc import Coroutine, Iterable, Mapping
+from collections.abc import Coroutine, Generator, Iterable, Mapping
+from contextlib import contextmanager
 from functools import partial
 from typing import TYPE_CHECKING, Any, Final, Literal, Optional, cast
 
@@ -13,6 +14,7 @@ from litellm.completion_extras.litellm_responses_transformation.transformation i
     LiteLLMResponsesTransformationHandler,
 )
 from litellm.constants import request_timeout
+from litellm.integrations.anthropic_cache_control_hook import CARRY_UNMATCHED_MESSAGE_POINTS
 from litellm.litellm_core_utils.asyncify import run_async_function
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.litellm_core_utils.prompt_templates.common_utils import (
@@ -390,6 +392,23 @@ async def aresponses_api_with_mcp(
     return response
 
 
+@contextmanager
+def _prompt_management_sees_a_provisional_message_list(
+    kwargs: dict[str, Any],  # mutable-ok: the signal is read and popped out of the caller's own kwargs
+) -> Generator[None, None]:
+    """Tell the cache-control hook that this layer's messages are not the ones sent upstream.
+
+    A Responses request keeps its system prompt in ``instructions``, which only becomes a
+    system message when the chat-completion bridge builds one, so a point targeting that
+    role matches nothing here. The hook hands those back instead of dropping them.
+    """
+    kwargs[CARRY_UNMATCHED_MESSAGE_POINTS] = True
+    try:
+        yield
+    finally:
+        kwargs.pop(CARRY_UNMATCHED_MESSAGE_POINTS, None)
+
+
 @client
 async def aresponses(
     input: str | ResponseInputParam,
@@ -467,19 +486,20 @@ async def aresponses(
                 client_input: list[AllMessageValues] = [{"role": "user", "content": input}]
             else:
                 client_input = [item for item in input if isinstance(item, dict) and "role" in item]
-            (
-                model,
-                merged_input,
-                merged_optional_params,
-            ) = await litellm_logging_obj.async_get_chat_completion_prompt(
-                model=model,
-                messages=client_input,
-                non_default_params=kwargs,
-                prompt_id=prompt_id,
-                prompt_variables=prompt_variables,
-                prompt_label=kwargs.get("prompt_label", None),
-                prompt_version=kwargs.get("prompt_version", None),
-            )
+            with _prompt_management_sees_a_provisional_message_list(kwargs):
+                (
+                    model,
+                    merged_input,
+                    merged_optional_params,
+                ) = await litellm_logging_obj.async_get_chat_completion_prompt(
+                    model=model,
+                    messages=client_input,
+                    non_default_params=kwargs,
+                    prompt_id=prompt_id,
+                    prompt_variables=prompt_variables,
+                    prompt_label=kwargs.get("prompt_label", None),
+                    prompt_version=kwargs.get("prompt_version", None),
+                )
             input = cast(
                 str | ResponseInputParam,
                 ResponsesAPIRequestUtils.merge_prompt_management_input(
@@ -585,19 +605,20 @@ def _apply_prompt_management_to_responses_call(
     if isinstance(litellm_logging_obj, LiteLLMLoggingObj) and litellm_logging_obj.should_run_prompt_management_hooks(
         prompt_id=prompt_id, non_default_params=kwargs
     ):
-        (
-            model,
-            merged_input,
-            merged_optional_params,
-        ) = litellm_logging_obj.get_chat_completion_prompt(
-            model=model,
-            messages=client_input,
-            non_default_params=kwargs,
-            prompt_id=prompt_id,
-            prompt_variables=prompt_variables,
-            prompt_label=kwargs.get("prompt_label", None),
-            prompt_version=kwargs.get("prompt_version", None),
-        )
+        with _prompt_management_sees_a_provisional_message_list(kwargs):
+            (
+                model,
+                merged_input,
+                merged_optional_params,
+            ) = litellm_logging_obj.get_chat_completion_prompt(
+                model=model,
+                messages=client_input,
+                non_default_params=kwargs,
+                prompt_id=prompt_id,
+                prompt_variables=prompt_variables,
+                prompt_label=kwargs.get("prompt_label", None),
+                prompt_version=kwargs.get("prompt_version", None),
+            )
         input = cast(
             str | ResponseInputParam,
             ResponsesAPIRequestUtils.merge_prompt_management_input(

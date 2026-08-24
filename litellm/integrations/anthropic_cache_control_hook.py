@@ -104,6 +104,13 @@ def _accepts_prompt_cache_breakpoint(block: object) -> bool:
     return isinstance(block, dict) and block.get("type") in OPENAI_PROMPT_CACHE_BREAKPOINT_BLOCK_TYPES
 
 
+# Set by a caller whose message list is not the one that goes upstream -- today the
+# Responses API layer, whose `instructions` only becomes a system message further down.
+# Tells this hook to hand back the message points that matched nothing here instead of
+# dropping them, so the layer holding the final messages still gets to place them.
+CARRY_UNMATCHED_MESSAGE_POINTS: Final = "_litellm_carry_unmatched_cache_control_points"
+
+
 class AnthropicCacheControlHook(CustomPromptManagement):
     def get_chat_completion_prompt(
         self,
@@ -128,6 +135,7 @@ class AnthropicCacheControlHook(CustomPromptManagement):
         - non_default_params: dict - params with any global cache controls
         """
         # Extract cache control injection points
+        carry_unmatched: Final = bool(non_default_params.pop(CARRY_UNMATCHED_MESSAGE_POINTS, False))
         injection_points: Final[list[CacheControlInjectionPoint]] = non_default_params.pop(
             "cache_control_injection_points", []
         )
@@ -177,10 +185,26 @@ class AnthropicCacheControlHook(CustomPromptManagement):
         ):
             non_default_params.setdefault("prompt_cache_options", PromptCacheOptions(mode="explicit"))
 
-        # Pass through non-message injection points for provider-specific handling
-        if remaining_points:
+        # Pass through the points this pass did not spend: non-message ones for the
+        # provider transform, and message ones that matched nothing here. A message point
+        # can be unmatched because the caller's messages simply lack that role, but also
+        # because this is not the last layer to see the request: the Responses API keeps
+        # its system prompt in `instructions`, which only becomes a system message once
+        # the chat-completion bridge builds one. Dropping those stranded the directive and
+        # left the whole surface uncached. The judged stamp is what makes carrying them
+        # safe -- the next pass must not re-judge points against messages this pass has
+        # already marked (see `_should_stand_down`).
+        carried_points: Final = remaining_points + [
+            point
+            for point in message_points
+            if carry_unmatched
+            and not AnthropicCacheControlHook._resolve_target_indices(
+                point, processed_messages, warn_out_of_bounds=False
+            )
+        ]
+        if carried_points:
             non_default_params["cache_control_injection_points"] = AnthropicCacheControlHook._stamped_as_judged(
-                remaining_points
+                carried_points
             )
 
         return model, processed_messages, non_default_params
@@ -272,9 +296,13 @@ class AnthropicCacheControlHook(CustomPromptManagement):
 
     @staticmethod
     def _resolve_target_indices(
-        point: CacheControlMessageInjectionPoint, messages: list[AllMessageValues]
+        point: CacheControlMessageInjectionPoint, messages: list[AllMessageValues], warn_out_of_bounds: bool = True
     ) -> list[int]:
-        """Resolve which message indices an injection point targets."""
+        """Resolve which message indices an injection point targets.
+
+        ``warn_out_of_bounds`` is off for callers only asking whether the point lands
+        here, so merely testing a point does not log it as skipped.
+        """
         _targetted_index: Final[int | str | None] = point.get("index", None)
         targetted_index: int | None = None
         if isinstance(_targetted_index, str):
@@ -294,12 +322,13 @@ class AnthropicCacheControlHook(CustomPromptManagement):
             if 0 <= targetted_index < len(messages):
                 return [targetted_index]
 
-            verbose_logger.warning(
-                "AnthropicCacheControlHook: Provided index %s is out of bounds for message list of length %s. Targeted index was %s. Skipping cache control injection for this point.",
-                original_index,
-                len(messages),
-                targetted_index,
-            )
+            if warn_out_of_bounds:
+                verbose_logger.warning(
+                    "AnthropicCacheControlHook: Provided index %s is out of bounds for message list of length %s. Targeted index was %s. Skipping cache control injection for this point.",
+                    original_index,
+                    len(messages),
+                    targetted_index,
+                )
             return []
 
         # Case 2: Target by role

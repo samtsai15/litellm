@@ -41,9 +41,7 @@ def _minimal_responses_api_payload(response_id: str, model: str) -> dict:
                 "id": "msg_1",
                 "status": "completed",
                 "role": "assistant",
-                "content": [
-                    {"type": "output_text", "text": "Done.", "annotations": []}
-                ],
+                "content": [{"type": "output_text", "text": "Done.", "annotations": []}],
             }
         ],
         "parallel_tool_calls": True,
@@ -83,9 +81,9 @@ class MockResponse:
 def _assert_request_body_matches(request_body: dict, expected_body: dict) -> None:
     for key, expected_value in expected_body.items():
         assert key in request_body, f"Missing key in request body: {key}"
-        assert (
-            request_body[key] == expected_value
-        ), f"Mismatch for key {key}: got {request_body[key]!r}, expected {expected_value!r}"
+        assert request_body[key] == expected_value, (
+            f"Mismatch for key {key}: got {request_body[key]!r}, expected {expected_value!r}"
+        )
 
 
 @pytest.mark.asyncio
@@ -100,9 +98,7 @@ async def test_aresponses_context_management_and_shell_request_body_matches_expe
         "litellm.llms.custom_httpx.http_handler.AsyncHTTPHandler.post",
         new_callable=AsyncMock,
     ) as mock_post:
-        mock_post.return_value = MockResponse(
-            _minimal_responses_api_payload("resp_ctx_shell_test", "gpt-4o"), 200
-        )
+        mock_post.return_value = MockResponse(_minimal_responses_api_payload("resp_ctx_shell_test", "gpt-4o"), 200)
 
         await litellm.aresponses(
             model="openai/gpt-4o",
@@ -427,6 +423,15 @@ async def test_aresponses_websocket_strips_responses_routing_prefix_from_openai_
 
 _INJECTION_POINT_INPUT = [{"role": "system", "content": "You are terse."}, {"role": "user", "content": "hi"}]
 _SYSTEM_INJECTION_POINT = [{"location": "message", "role": "system"}]
+_ANTHROPIC_MESSAGES_PAYLOAD = {
+    "id": "msg_1",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-sonnet-4-5",
+    "content": [{"type": "text", "text": "Done."}],
+    "stop_reason": "end_turn",
+    "usage": {"input_tokens": 10, "output_tokens": 5},
+}
 
 
 def _sent_body(mock_post) -> dict:
@@ -598,3 +603,90 @@ def test_responses_custom_api_base_sends_no_openai_markers():
         body = _sent_body(mock_post)
         assert body["input"] == _INJECTION_POINT_INPUT
         assert "prompt_cache_options" not in body
+
+
+@pytest.mark.asyncio
+async def test_injection_points_still_reach_a_native_responses_provider():
+    """Providers that serve Responses natively never reach the chat-completions bridge,
+    so this layer is their only chance to inject and must keep doing so."""
+    injected_client = AsyncHTTPHandler()
+    mock_post = AsyncMock(return_value=MockResponse(_minimal_responses_api_payload("resp_native", "gpt-5.6"), 200))
+    injected_client.post = mock_post
+
+    await litellm.aresponses(
+        model="openai/gpt-5.6",
+        api_key="fake-api-key",
+        input=copy.deepcopy(_INJECTION_POINT_INPUT),
+        cache_control_injection_points=copy.deepcopy(_SYSTEM_INJECTION_POINT),
+        client=injected_client,
+    )
+
+    body = _sent_body(mock_post)
+    assert body["input"][0]["content"][0]["prompt_cache_breakpoint"] == {"mode": "explicit"}
+    assert "cache_control_injection_points" not in body
+
+
+async def _bridged_body(mock_post, *, points, input, instructions="You are a documentation assistant."):
+    injected_client = AsyncHTTPHandler()
+    injected_client.post = mock_post
+
+    await litellm.aresponses(
+        model="anthropic/claude-sonnet-4-5",
+        api_key="fake-api-key",
+        instructions=instructions,
+        input=copy.deepcopy(input),
+        cache_control_injection_points=copy.deepcopy(points),
+        client=injected_client,
+    )
+    return _sent_body(mock_post)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param("hi", id="string-content"),
+        pytest.param([{"type": "input_text", "text": "hi there friend"}], id="list-content"),
+    ],
+)
+@pytest.mark.parametrize(
+    "points",
+    [
+        pytest.param([{"location": "message", "role": "system"}], id="system-only"),
+        pytest.param(
+            [{"location": "message", "role": "user"}, {"location": "message", "role": "system"}],
+            id="mixed-user-and-system",
+        ),
+    ],
+)
+async def test_instructions_are_marked_when_the_bridge_builds_the_system_message(points, content):
+    """The system prompt lives in `instructions`, which is not a message until the bridge
+    builds one, so the point targeting it matches nothing at the Responses layer.
+
+    Carrying it forward is what marks it at all. Carrying it *stamped* is what keeps a
+    second point that did match from stranding it: without the stamp the next pass reads
+    litellm's own marks as client breakpoints and stands the whole configuration down.
+    """
+    mock_post = AsyncMock(return_value=MockResponse(_ANTHROPIC_MESSAGES_PAYLOAD, 200))
+    body = await _bridged_body(mock_post, points=points, input=[{"role": "user", "content": content}])
+
+    assert body["system"][0]["cache_control"] == {"type": "ephemeral"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("instructions", [None, "You are a documentation assistant."])
+async def test_positional_points_address_the_input_item_the_caller_indexed(instructions):
+    """`index` counts the caller's `input` items, and the Responses layer is where that
+    list still is, so a matched positional point must be spent there and never re-resolved
+    against the bridge's list, where the system message shifts every ordinal by one."""
+    mock_post = AsyncMock(return_value=MockResponse(_ANTHROPIC_MESSAGES_PAYLOAD, 200))
+    body = await _bridged_body(
+        mock_post,
+        points=[{"location": "message", "index": 0}],
+        input=[{"role": "user", "content": [{"type": "input_text", "text": "hi there friend"}]}],
+        instructions=instructions,
+    )
+
+    assert body["messages"][0]["content"][0]["cache_control"] == {"type": "ephemeral"}
+    if instructions:
+        assert "cache_control" not in json.dumps(body["system"])
