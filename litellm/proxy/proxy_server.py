@@ -3404,6 +3404,7 @@ async def _run_direct_health_check_with_instrumentation(
                 model_list=model_list,
                 details=details,
                 max_concurrency=max_concurrency,
+                router=llm_router,
                 **extra_kwargs,
             )
         except TypeError as e:
@@ -3666,6 +3667,7 @@ async def _run_background_health_check():
                     model_list=_llm_model_list,
                     details=details_bool,
                     max_concurrency=health_check_concurrency,
+                    router=llm_router,
                     **_hc_filter,
                 )
             except Exception as e:

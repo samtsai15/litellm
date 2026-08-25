@@ -684,3 +684,106 @@ async def test_run_model_health_check_skips_complexity_router_deployment():
 
     fake_ahealth_check.assert_not_called()
     assert result == {}
+
+
+def _router_health_fixture():
+    """A real Router whose SIMPLE tier, default and classifier can each be pointed at a dead group."""
+    return litellm.Router(
+        model_list=[
+            {
+                "model_name": "live-group",
+                "litellm_params": {"model": "openai/gpt-4o-mini", "api_key": "sk-x"},
+                "model_info": {"id": "live-1"},
+            },
+            {
+                "model_name": "dead-group",
+                "litellm_params": {"model": "openai/gpt-4o-mini", "api_key": "sk-x"},
+                "model_info": {"id": "dead-1"},
+            },
+            {
+                "model_name": "smart-router",
+                "litellm_params": {
+                    "model": "auto_router/complexity_router",
+                    "complexity_router_config": {"tiers": {"SIMPLE": "dead-group", "MEDIUM": "live-group"}},
+                    "complexity_router_default_model": "live-group",
+                },
+                "model_info": {"id": "router-1"},
+            },
+        ],
+        ignore_invalid_deployments=True,
+    )
+
+
+def _marker_deployment(router):
+    return next(d for d in router.model_list if d["model_info"]["id"] == "router-1")
+
+
+def test_strategy_router_reds_when_a_tier_group_has_no_healthy_deployment():
+    """LIT-6073: the marker is filed healthy by the {} placeholder; the verdict must override it."""
+    router = _router_health_fixture()
+    healthy = [{"model_id": "router-1"}, {"model_id": "live-1"}]
+    unhealthy = [{"model_id": "dead-1", "error": "boom"}]
+
+    new_healthy, new_unhealthy = hc_module._finalize_strategy_router_endpoints(
+        healthy, unhealthy, router.model_list, router, ()
+    )
+
+    assert [e["model_id"] for e in new_healthy] == ["live-1"]
+    moved = next(e for e in new_unhealthy if e["model_id"] == "router-1")
+    assert moved["error"] == "tier model 'dead-group' has no healthy deployment"
+
+
+def test_strategy_router_stays_green_when_every_dependency_has_a_healthy_deployment():
+    """The negative class: same router, same code path, nothing unhealthy behind it."""
+    router = _router_health_fixture()
+    healthy = [{"model_id": "router-1"}, {"model_id": "live-1"}, {"model_id": "dead-1"}]
+
+    new_healthy, new_unhealthy = hc_module._finalize_strategy_router_endpoints(
+        healthy, [], router.model_list, router, ()
+    )
+
+    assert {e["model_id"] for e in new_healthy} == {"router-1", "live-1", "dead-1"}
+    assert new_unhealthy == ()
+
+
+def test_strategy_router_reds_when_a_dependency_name_matches_no_deployment():
+    """An unresolvable tier name is a different fault from an unhealthy one, and says so."""
+    router = _router_health_fixture()
+    marker = _marker_deployment(router)
+    marker["litellm_params"]["complexity_router_config"]["tiers"]["SIMPLE"] = "typo-group"
+
+    _, new_unhealthy = hc_module._finalize_strategy_router_endpoints(
+        [{"model_id": "router-1"}], [], router.model_list, router, ()
+    )
+
+    assert new_unhealthy[0]["error"] == "tier model 'typo-group' matches no deployment on this proxy"
+
+
+def test_strategy_router_verdict_is_silent_when_the_dependency_is_not_visible_to_the_caller():
+    """Absent information never reds a router: a dependency the caller cannot see proves nothing."""
+    router = _router_health_fixture()
+    caller_scope = [d for d in router.model_list if d["model_info"]["id"] in ("router-1", "live-1")]
+
+    new_healthy, new_unhealthy = hc_module._finalize_strategy_router_endpoints(
+        [{"model_id": "router-1"}], [], caller_scope, router, ()
+    )
+
+    assert [e["model_id"] for e in new_healthy] == ["router-1"]
+    assert new_unhealthy == ()
+
+
+def test_dependency_probe_expansion_is_a_no_op_when_every_dependency_is_already_checked():
+    """The full-list run must gain no extra probe, or /health doubles its provider spend."""
+    router = _router_health_fixture()
+
+    assert hc_module._dependency_deployments_to_probe(router.model_list, router.model_list, router) == ()
+
+
+def test_dependency_probe_expansion_adds_dependencies_for_a_targeted_router_check():
+    """GET /health?model_id=<router> narrows to the marker, so the deps must be pulled back in."""
+    router = _router_health_fixture()
+    marker_only = [_marker_deployment(router)]
+
+    probes = hc_module._dependency_deployments_to_probe(marker_only, router.model_list, router)
+
+    assert {d["model_info"]["id"] for d in probes} == {"dead-1", "live-1"}
